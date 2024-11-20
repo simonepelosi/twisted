@@ -107,11 +107,11 @@ import math
 import os
 import re
 import tempfile
-import time
 import warnings
 from email import message_from_bytes
 from email.message import EmailMessage, Message
 from io import BufferedIOBase, BytesIO, TextIOWrapper
+from time import gmtime, time
 from typing import (
     AnyStr,
     Callable,
@@ -134,7 +134,13 @@ from incremental import Version
 from twisted.internet import address, interfaces, protocol
 from twisted.internet._producer_helpers import _PullToPush
 from twisted.internet.defer import Deferred
-from twisted.internet.interfaces import IAddress, IDelayedCall, IProtocol, IReactorTime
+from twisted.internet.interfaces import (
+    IAddress,
+    IDelayedCall,
+    IProtocol,
+    IReactorTime,
+    ITCPTransport,
+)
 from twisted.internet.protocol import Protocol
 from twisted.logger import Logger
 from twisted.protocols import basic, policies
@@ -223,8 +229,7 @@ responses = RESPONSES
 
 # datetime parsing and formatting
 weekdayname = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
-monthname = [
-    None,
+_months = [
     "Jan",
     "Feb",
     "Mar",
@@ -238,6 +243,9 @@ monthname = [
     "Nov",
     "Dec",
 ]
+monthname = [None] + _months
+_weekdaynameBytes = [s.encode("ascii") for s in weekdayname]
+_monthnameBytes = [None] + [s.encode("ascii") for s in _months]
 weekdayname_lower = [name.lower() for name in weekdayname]
 monthname_lower = [name and name.lower() for name in monthname]
 
@@ -397,14 +405,18 @@ def datetimeToString(msSinceEpoch=None):
 
     @rtype: C{bytes}
     """
-    if msSinceEpoch == None:
-        msSinceEpoch = time.time()
-    year, month, day, hh, mm, ss, wd, y, z = time.gmtime(msSinceEpoch)
-    s = networkString(
-        "%s, %02d %3s %4d %02d:%02d:%02d GMT"
-        % (weekdayname[wd], day, monthname[month], year, hh, mm, ss)
+    year, month, day, hh, mm, ss, wd, _, _ = (
+        gmtime() if msSinceEpoch is None else gmtime(msSinceEpoch)
     )
-    return s
+    return b"%s, %02d %3s %4d %02d:%02d:%02d GMT" % (
+        _weekdaynameBytes[wd],
+        day,
+        _monthnameBytes[month],
+        year,
+        hh,
+        mm,
+        ss,
+    )
 
 
 def datetimeToLogString(msSinceEpoch=None):
@@ -414,8 +426,9 @@ def datetimeToLogString(msSinceEpoch=None):
     @rtype: C{str}
     """
     if msSinceEpoch == None:
-        msSinceEpoch = time.time()
-    year, month, day, hh, mm, ss, wd, y, z = time.gmtime(msSinceEpoch)
+        # This code path is apparently never used in practice inside Twisted.
+        msSinceEpoch = time()  # pragma: no cover
+    year, month, day, hh, mm, ss, wd, y, z = gmtime(msSinceEpoch)
     s = "[%02d/%3s/%4d:%02d:%02d:%02d +0000]" % (
         day,
         monthname[month],
@@ -1794,6 +1807,8 @@ class _IdentityTransferDecoder:
         chunk.
     """
 
+    __slots__ = ["contentLength", "dataCallback", "finishCallback"]
+
     def __init__(self, contentLength, dataCallback, finishCallback):
         self.contentLength = contentLength
         self.dataCallback = dataCallback
@@ -2290,7 +2305,7 @@ class HTTPChannel(basic.LineReceiver, policies.TimeoutMixin):
     totalHeadersSize = 16384
     abortTimeout = 15
 
-    length = 0
+    length: Optional[int] = 0
     persistent = 1
     __header = b""
     __first_line = 1
@@ -2317,6 +2332,8 @@ class HTTPChannel(basic.LineReceiver, policies.TimeoutMixin):
         self._transferDecoder = None
 
     def connectionMade(self):
+        if ITCPTransport.providedBy(self.transport):
+            self.transport.setTcpNoDelay(True)
         self.setTimeout(self.timeOut)
         self._networkProducer = interfaces.IPushProducer(
             self.transport, _NoPushProducer()
@@ -2397,6 +2414,14 @@ class HTTPChannel(basic.LineReceiver, policies.TimeoutMixin):
         self._dataBuffer.append(data)
         self.allContentReceived()
 
+    def _failChooseTransferDecoder(self) -> bool:
+        """
+        Utility to indicate failure to choose a decoder.
+        """
+        self._respondToBadRequestAndDisconnect()
+        self.length = None
+        return False
+
     def _maybeChooseTransferDecoder(self, header, data):
         """
         If the provided header is C{content-length} or
@@ -2404,20 +2429,11 @@ class HTTPChannel(basic.LineReceiver, policies.TimeoutMixin):
 
         Returns L{True} if the request can proceed and L{False} if not.
         """
-
-        def fail():
-            self._respondToBadRequestAndDisconnect()
-            self.length = None
-            return False
-
         # Can this header determine the length?
         if header == b"Content-Length":
             if not data.isdigit():
-                return fail()
-            try:
-                length = int(data)
-            except ValueError:
-                return fail()
+                return self._failChooseTransferDecoder()
+            length = int(data)
             newTransferDecoder = _IdentityTransferDecoder(
                 length, self.requests[-1].handleContentChunk, self._finishRequestBody
             )
@@ -2432,13 +2448,13 @@ class HTTPChannel(basic.LineReceiver, policies.TimeoutMixin):
             elif data.lower() == b"identity":
                 return True
             else:
-                return fail()
+                return self._failChooseTransferDecoder()
         else:
             # It's not a length related header, so exit
             return True
 
         if self._transferDecoder is not None:
-            return fail()
+            return self._failChooseTransferDecoder()
         else:
             self.length = length
             self._transferDecoder = newTransferDecoder
